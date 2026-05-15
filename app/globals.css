@@ -1,0 +1,16 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  line-height: 1.5;
+  color: #111;
+  background: #fafafa;
+}
+
+code {
+  background: #eee;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
