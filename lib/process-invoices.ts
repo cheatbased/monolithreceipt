@@ -1,12 +1,27 @@
 import { Readable } from "node:stream";
 import type { gmail_v1 } from "googleapis";
 import {
+  driveMonthFolderTitle,
+  messageDateFromInternalMs,
+  type MonthFolderFormatting,
+  type MonthFolderStyle,
+} from "./drive-month-folder";
+import { buildFrenchFiscalTrimesterPath, type FrTrimesterNaming, type FyLeafCounterStyle } from "./fr-fy-trimesters";
+import {
   buildBillingSearchQuery,
   flattenAttachmentParts,
   type AttachmentMeta,
 } from "./gmail-helpers";
 import type { Gmail } from "./google-clients";
 import { driveClient, gmailClient } from "./google-clients";
+import { getOrCreateChildFolder, resolveFolderSegments } from "./drive-subfolders";
+import {
+  normalizeRoutingMime,
+  readRoutingDateSource,
+  resolveRoutingInstant,
+  type RoutingDateSource,
+  type RoutingResolution,
+} from "./resolve-routing-date";
 
 export const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
@@ -21,11 +36,14 @@ export type ProcessInvoicesResult = {
     driveFileId: string;
     driveFileName: string;
     sourceAttachmentFilename?: string | null;
+    routingVia?: RoutingResolution["via"];
   }>;
   skippedNoAttachments: Array<{ messageId: string }>;
   skippedNonPdf?: Array<{ messageId: string; mimeType?: string | null }>;
   failures: Array<{ messageId?: string; error: string }>;
 };
+
+export type DriveOrganizationMode = "none" | "iso_month" | "fy_trimesters_fr";
 
 export type ProcessEnvConfig = {
   billingLabelName: string;
@@ -33,13 +51,63 @@ export type ProcessEnvConfig = {
   driveParentFolderId: string;
   maxMessagesPerRun: number;
   requirePdfOnly: boolean;
+  driveOrganization: DriveOrganizationMode;
+  organizeByMonth: boolean;
+  monthFormatting: MonthFolderFormatting;
+  fyTrimNaming: FrTrimesterNaming;
+  routingDateSource: RoutingDateSource;
 };
+
+function readDriveOrganization(): DriveOrganizationMode {
+  const raw = (process.env.DRIVE_ORGANIZATION ?? "").trim().toLowerCase().replace(/-/g, "_");
+
+  if (
+    raw === "fy_trimesters_fr" ||
+    raw === "fy_trimestres_fr" ||
+    raw === "fr_fy_trimesters" ||
+    raw === "fr_trimestres"
+  ) {
+    return "fy_trimesters_fr";
+  }
+
+  if (raw === "iso_month" || raw === "month" || raw === "flat_iso") {
+    return "iso_month";
+  }
+
+  if (raw === "none" || raw === "root") return "none";
+
+  if (raw) {
+    throw new Error(
+      `Unknown DRIVE_ORGANIZATION="${process.env.DRIVE_ORGANIZATION}" (use none | iso_month | fy_trimesters_fr).`,
+    );
+  }
+
+  const legacyMonth = (process.env.ORGANIZE_BY_MONTH ?? "true").toLowerCase();
+
+  return legacyMonth === "false" || legacyMonth === "0" ? "none" : "iso_month";
+}
 
 function readProcessEnv(): ProcessEnvConfig {
   const driveParentFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID?.trim();
   if (!driveParentFolderId) {
     throw new Error("Missing GOOGLE_DRIVE_FOLDER_ID");
   }
+
+  const folderStyleRaw = (process.env.DRIVE_MONTH_FOLDER_STYLE ?? "yyyy-mm").toLowerCase();
+  const folderStyle: MonthFolderStyle = folderStyleRaw === "long" ? "long" : "yyyy-mm";
+
+  const driveOrganization = readDriveOrganization();
+
+  const leafCounterRaw = (process.env.FY_LEAF_COUNTER ?? "fiscal").toLowerCase().trim();
+  const leafCounterStyle: FyLeafCounterStyle =
+    leafCounterRaw === "quarter" ? "quarter_slot" : "fiscal_year_index";
+
+  const fyTrimNaming: FrTrimesterNaming = {
+    timeZone: (process.env.FY_SUBFOLDER_TIME_ZONE ?? process.env.DRIVE_SUBFOLDER_TIME_ZONE ?? "UTC").trim(),
+    trimestreFolderTemplate: (process.env.FY_TRIMESTRE_FOLDER_TEMPLATE ?? "Trimestre {{t}}").trim(),
+    monthLeafFolderTemplate: (process.env.FY_MONTH_LEAF_FOLDER_TEMPLATE ?? "{{n}}. {{MONTH_FR}}").trim(),
+    leafCounterStyle,
+  };
 
   return {
     billingLabelName: (process.env.BILLING_LABEL ?? "Billing").trim(),
@@ -50,6 +118,15 @@ function readProcessEnv(): ProcessEnvConfig {
       Math.max(1, Number.parseInt(process.env.MAX_MESSAGES_PER_RUN ?? "10", 10) || 10),
     ),
     requirePdfOnly: (process.env.REQUIRE_PDF_ONLY ?? "true").toLowerCase() !== "false",
+    driveOrganization,
+    organizeByMonth: (process.env.ORGANIZE_BY_MONTH ?? "true").toLowerCase() !== "false",
+    monthFormatting: {
+      style: folderStyle,
+      timeZone: (process.env.DRIVE_SUBFOLDER_TIME_ZONE ?? "UTC").trim(),
+      locale: (process.env.DRIVE_SUBFOLDER_LOCALE ?? "en-US").trim(),
+    },
+    fyTrimNaming,
+    routingDateSource: readRoutingDateSource(),
   };
 }
 
@@ -70,9 +147,7 @@ function pickSubject(message: gmail_v1.Schema$Message): string {
   return subject?.trim() ? subject.trim() : "invoice";
 }
 
-function formatDatePrefix(internalMs: string | undefined | null): string {
-  const ms = internalMs ? Number(internalMs) : Date.now();
-  const d = new Date(Number.isFinite(ms) ? ms : Date.now());
+function formatDateYmdUtc(d: Date): string {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
@@ -120,6 +195,33 @@ function selectAttachments(
 
   const selected = attachments.length ? attachments : pdfs;
   return { selected, skippedNonPdf: [] };
+}
+
+type Drive = ReturnType<typeof driveClient>;
+
+async function resolveDriveUploadParent(
+  driveApi: Drive,
+  config: ProcessEnvConfig,
+  routingInstant: Date,
+): Promise<string> {
+  if (config.driveOrganization === "none") {
+    return config.driveParentFolderId;
+  }
+
+  if (config.driveOrganization === "fy_trimesters_fr") {
+    const frPath = buildFrenchFiscalTrimesterPath(routingInstant, config.fyTrimNaming);
+    return resolveFolderSegments(driveApi, config.driveParentFolderId, [
+      frPath.trimestreFolder,
+      frPath.monthFolder,
+    ]);
+  }
+
+  if (config.driveOrganization === "iso_month" && config.organizeByMonth) {
+    const monthTitle = driveMonthFolderTitle(routingInstant, config.monthFormatting);
+    return getOrCreateChildFolder(driveApi, config.driveParentFolderId, monthTitle);
+  }
+
+  return config.driveParentFolderId;
 }
 
 export async function processInvoices(options: {
@@ -180,8 +282,13 @@ export async function processInvoices(options: {
       }
 
       const subject = pickSubject(msg);
-      const datePrefix = formatDatePrefix(msg.internalDate);
       const subjectBase = sanitizeBaseName(subject) || "invoice";
+      const msgInstant = messageDateFromInternalMs(msg.internalDate);
+
+      let sharedUploadParentId: string | undefined;
+      if (config.routingDateSource === "gmail") {
+        sharedUploadParentId = await resolveDriveUploadParent(driveApi, config, msgInstant);
+      }
 
       let index = 0;
       for (const att of selected) {
@@ -195,7 +302,6 @@ export async function processInvoices(options: {
         const originalBase = att.filename
           ? sanitizeBaseName(att.filename.replace(/\.[^.]+$/, ""))
           : "attachment";
-        const driveName = `${datePrefix}_${subjectBase}${suffix}_${originalBase}${ext}`;
 
         const attResp = await gmailApi.users.messages.attachments.get({
           userId: "me",
@@ -208,6 +314,23 @@ export async function processInvoices(options: {
 
         const buffer = decodeBase64Url(b64);
 
+        let routing: RoutingResolution;
+        if (config.routingDateSource === "gmail") {
+          routing = { routingInstant: msgInstant, via: "gmail" };
+        } else if (!normalizeRoutingMime(att.mimeType)) {
+          routing = { routingInstant: msgInstant, via: "fallback_gmail" };
+        } else {
+          routing = await resolveRoutingInstant(msg.internalDate, buffer, "invoice", att.mimeType);
+        }
+
+        const uploadParentId =
+          config.routingDateSource === "gmail"
+            ? sharedUploadParentId!
+            : await resolveDriveUploadParent(driveApi, config, routing.routingInstant);
+
+        const datePrefix = formatDateYmdUtc(routing.routingInstant);
+        const driveName = `${datePrefix}_${subjectBase}${suffix}_${originalBase}${ext}`;
+
         const mimeType =
           att.mimeType ||
           (ext === ".pdf" ? "application/pdf" : "application/octet-stream");
@@ -215,7 +338,7 @@ export async function processInvoices(options: {
         const uploaded = await driveApi.files.create({
           requestBody: {
             name: driveName,
-            parents: [config.driveParentFolderId],
+            parents: [uploadParentId],
           },
           media: { mimeType, body: bufferToReadable(buffer) },
           fields: "id,name,mimeType",
@@ -223,12 +346,16 @@ export async function processInvoices(options: {
 
         if (!uploaded.data.id) throw new Error("Drive upload succeeded without file id");
 
-        result.uploaded.push({
+        const uploadRow: (typeof result.uploaded)[number] = {
           messageId,
           driveFileId: uploaded.data.id,
           driveFileName: uploaded.data.name ?? driveName,
           sourceAttachmentFilename: att.filename,
-        });
+        };
+        if (config.routingDateSource === "invoice") {
+          uploadRow.routingVia = routing.via;
+        }
+        result.uploaded.push(uploadRow);
       }
 
       await gmailApi.users.messages.modify({
