@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/cron/process-invoices",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 7 * * *"
     }
   ]
 }

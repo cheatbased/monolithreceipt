@@ -94,6 +94,13 @@ Spellings such as **`FEVRIER`**, **`AOUT`** and **`NOVEMBRE`** intentionally mir
 
 Hosted HTTPS cron + typed env vars (`DRIVE_ORGANIZATION`, `FY_LEAF_COUNTER`, Gmail tokens, Drive scope). See `.env.example` for **`fy_trimesters_fr`** vs **`iso_month`**.
 
+### Vercel Cron plan limits
+
+**Hobby:** cron runs **at most once per day** (this repo’s `vercel.json` uses **`0 7 * * *`** = daily ~07:00 UTC). Anything like every 15 minutes **will fail deployment**.  
+**Pro+:** can schedule every minute if needed.
+
+If you stay on Hobby but want runs **more often**, skip Vercel Cron and use an external scheduler (e.g. cron-job.org) to **`GET`** `https://YOUR_DOMAIN/api/cron/process-invoices` with header **`Authorization: Bearer YOUR_CRON_SECRET`** at whatever interval you want.
+
 ### Invoice date routing (PDF / JPEG / PNG + optional OCR)
 
 By default, **`ROUTING_DATE_SOURCE=gmail`** uses Gmail’s message timestamp for the filename prefix (`yyyy-mm-dd_…`) and for folder placement. Set **`ROUTING_DATE_SOURCE=invoice`** to derive the date per attachment:
