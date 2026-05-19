@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "oauth": "node --env-file=.env scripts/oauth-setup.mjs"
+    "oauth": "node --env-file=.env scripts/oauth-setup.mjs",
+    "google-diag": "node --env-file=.env scripts/google-diag.mjs"
   },
   "dependencies": {
     "google-auth-library": "^10.6.2",

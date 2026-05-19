@@ -342,6 +342,7 @@ export async function processInvoices(options: {
           },
           media: { mimeType, body: bufferToReadable(buffer) },
           fields: "id,name,mimeType",
+          supportsAllDrives: true,
         });
 
         if (!uploaded.data.id) throw new Error("Drive upload succeeded without file id");

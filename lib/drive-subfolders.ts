@@ -43,6 +43,8 @@ export async function getOrCreateChildFolder(
     spaces: "drive",
     fields: "files(id)",
     pageSize: 5,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
   });
 
   let resolved = listed.data.files?.[0]?.id;
@@ -55,6 +57,7 @@ export async function getOrCreateChildFolder(
         parents: [parentFolderId],
       },
       fields: "id",
+      supportsAllDrives: true,
     });
     resolved = created.data.id ?? undefined;
   }
