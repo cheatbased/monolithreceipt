@@ -1,17 +1,17 @@
-import { PDFParse } from "pdf-parse";
-
-/** Embedded text when the PDF stores it digitally (no OCR). */
+/**
+ * Embedded text extraction (digital PDFs). Uses pdf-parse v1 — avoids pdfjs-dist v4 + canvas/DOM deps that break Vercel.
+ */
 
 export async function tryExtractPdfEmbeddedText(buffer: Buffer): Promise<string | null> {
   try {
-    const parser = new PDFParse({ data: buffer });
-    try {
-      const textResult = await parser.getText();
-      const text = typeof textResult.text === "string" ? textResult.text.trim() : "";
-      return text.length > 40 ? text : null;
-    } finally {
-      await parser.destroy();
-    }
+    const modUnknown = await import("pdf-parse");
+    const pdfParseFn =
+      typeof modUnknown === "function"
+        ? (modUnknown as (b: Buffer) => Promise<{ text?: string }>)
+        : (modUnknown as { default: (b: Buffer) => Promise<{ text?: string }> }).default;
+    const parsed = await pdfParseFn(buffer);
+    const text = typeof parsed?.text === "string" ? parsed.text.trim() : "";
+    return text.length > 40 ? text : null;
   } catch {
     return null;
   }

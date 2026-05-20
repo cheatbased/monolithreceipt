@@ -1,7 +1,6 @@
 import { documentAiInvoiceText } from "./document-ai";
 import { guessInvoiceDate } from "./guess-invoice-date";
 import { messageDateFromInternalMs } from "./drive-month-folder";
-import { tryExtractPdfEmbeddedText } from "./pdf-text";
 
 export type RoutingDateSource = "gmail" | "invoice";
 
@@ -57,6 +56,7 @@ export async function resolveRoutingInstant(
   }
 
   if (routingMime === "application/pdf") {
+    const { tryExtractPdfEmbeddedText } = await import("./pdf-text");
     const embedded = await tryExtractPdfEmbeddedText(buffer);
     if (embedded) {
       const guessed = guessInvoiceDate(embedded, emailInstant);
